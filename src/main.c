@@ -13,6 +13,34 @@
 #include <openssl/crypto.h>
 #include <openssl/ssl.h>
 
+#include "basic_defs.h"
+
+#include "block-store.h"
+#include "peergroup.h"
+#include "poolworker.h"
+#include "util.h"
+#include "hashtable.h"
+#include "wallet.h"
+#include "config.h"
+#include "poll.h"
+#include "netasync.h"
+#include "key.h"
+#include "addrbook.h"
+#include "serialize.h"
+#include "file.h"
+#include "bitc.h"
+#include "buff.h"
+#include "test.h"
+#include "ncui.h"
+#include "base58.h"
+#include "ip_info.h"
+#include "crypt.h"
+#include "rpc.h"
+#include "bitc_ui.h"
+
+
+#define LGPFX "BITC:"
+
 /*
  *----------------------------------------------------------------
  *
@@ -42,6 +70,39 @@ bitc_load_config(struct config **config,
       Warning("Please create a minimal config: %s\n", path);
    }
    free(defaultPath);
+   return res;
+}
+
+/*
+ *------------------------------------------------------------------------
+ *
+ * bitc_check_create_file --
+ *
+ *------------------------------------------------------------------------
+ */
+
+static int
+bitc_check_create_file(const char *filename,
+                       const char *label)
+{
+   int res;
+
+   if (file_exists(filename)) {
+      return 0;
+   }
+
+   Log(LGPFX" creating %s file: %s\n", label, filename);
+   res = file_create(filename);
+   if (res) {
+      printf("Failed to create %s file '%s': %s\n",
+             label, filename, strerror(res));
+      return res;
+   }
+   res = file_chmod(filename, 0600);
+   if (res) {
+      printf("Failed to chmod 0600 %s file '%s': %s\n",
+             label, filename, strerror(res));
+   }
    return res;
 }
 
@@ -207,6 +268,45 @@ bitc_openssl_init(void)
    CRYPTO_set_locking_callback(bitc_openssl_lock_fun);
 }
 
+/*
+ *---------------------------------------------------------------------
+ *
+ * bitc_openssl_thread_id_fun --
+ *
+ *---------------------------------------------------------------------
+ */
+
+static unsigned long
+bitc_openssl_thread_id_fun(void)
+{
+   return (unsigned long)pthread_self();
+}
+
+/*
+ *---------------------------------------------------------------------
+ *
+ * bitc_openssl_lock_fun --
+ *
+ *---------------------------------------------------------------------
+ */
+
+static pthread_mutex_t *ssl_mutex_array;
+
+static void
+bitc_openssl_lock_fun(int mode,
+                      int n,
+                      const char *file,
+                      int line)
+{
+   pthread_mutex_t *lock = &ssl_mutex_array[n];
+
+   if (mode & CRYPTO_LOCK) {
+      pthread_mutex_lock(lock);
+   } else {
+      pthread_mutex_unlock(lock);
+   }
+}
+
 
 /*
  *---------------------------------------------------------------------
@@ -229,6 +329,154 @@ bitc_usage(void)
           " -T, --testnet                  connect to testnet\n"
           " -v, --version                  display version string and exit\n"
           BTC_CLIENT_DESC);
+}
+
+/*
+ *----------------------------------------------------------------
+ *
+ * bitc_req_init --
+ *
+ *----------------------------------------------------------------
+ */
+
+static int
+bitc_req_init(void)
+{
+   int fd[2];
+   int flags;
+   int res;
+
+   res = pipe(fd);
+   if (res != 0) {
+      res = errno;
+      Log(LGPFX" Failed to create pipe: %s\n", strerror(res));
+      return res;
+   }
+   btc->eventFd  = fd[0];
+   btc->notifyFd = fd[1];
+
+   flags = fcntl(btc->eventFd, F_GETFL, 0);
+   if (flags < 0) {
+      NOT_TESTED();
+      return flags;
+   }
+
+   res = fcntl(btc->eventFd, F_SETFL, flags | O_NONBLOCK);
+   if (res < 0) {
+      NOT_TESTED();
+      return res;
+   }
+   poll_callback_device(btc->poll, btc->eventFd, 1, 0, 1, bitc_req_cb, NULL);
+   btc->notifyInit = 1;
+
+   return 0;
+}
+
+/*
+ *---------------------------------------------------------------------
+ *
+ * bitc_bye --
+ *
+ *---------------------------------------------------------------------
+ */
+
+static void
+bitc_bye(void)
+{
+	//TODO: exit message with stats?
+    //printf("Contribute! https://github.com/bit-c/bitc\n");
+}
+
+/*
+ *----------------------------------------------------------------
+ *
+ * bitc_poll_init --
+ *
+ *----------------------------------------------------------------
+ */
+
+static void
+bitc_poll_init(void)
+{
+   btc->poll = poll_create();
+}
+
+/*
+ *----------------------------------------------------------------
+ *
+ * bitc_init --
+ *
+ *----------------------------------------------------------------
+ */
+
+static int
+bitc_init(struct secure_area *passphrase,
+          bool                updateAndExit,
+          int                 maxPeers,
+          int                 minPeersInit,
+          char              **errStr)
+{
+   int res;
+
+   Log(LGPFX" %s -- BITC_STATE_STARTING.\n", __FUNCTION__);
+   btc->state = BITC_STATE_STARTING;
+   btc->updateAndExit = updateAndExit;
+
+   util_bumpnofds();
+   bitc_poll_init();
+   bitc_req_init();
+   netasync_init(btc->poll);
+
+   if (config_getbool(btc->config, FALSE, "network.useSocks5")) {
+      btc->socks5_proxy = config_getstring(btc->config, "localhost", "socks5.hostname");
+      btc->socks5_port  = config_getint64(btc->config,
+#ifdef linux
+                                          9050,
+#else
+                                          9150,
+#endif
+                                          "socks5.port");
+      Log(LGPFX" Using SOCKS5 proxy %s:%u.\n",
+          btc->socks5_proxy, btc->socks5_port);
+   }
+#ifdef WITHUI
+   bitcui_set_status("loading addrbook..");
+#else
+   printf("loading addrbook..\n");
+#endif
+   addrbook_open(btc->config, &btc->book);
+
+#ifdef WITHUI
+   bitcui_set_status("opening blockstore..");
+#else
+   printf("opening blockstore..\n");
+#endif
+   res = blockstore_init(btc->config, &btc->blockStore);
+   if (res) {
+      *errStr = "Failed to open block-store.";
+      return res;
+   }
+
+   peergroup_init(btc->config, maxPeers, minPeersInit, 15 * 1000 * 1000); // 15 sec
+
+#ifdef WITHUI
+   bitcui_set_status("loading wallet..");
+#else
+   printf("loading wallet..\n");
+#endif
+   res = wallet_open(btc->config, passphrase, errStr, &btc->wallet);
+   if (res != 0) {
+      return res;
+   }
+
+#ifdef WITHUI
+   bitcui_set_status("adding peers..");
+#else
+   printf("adding peers..\n");
+#endif
+   peergroup_seed();
+
+   return rpc_init();
 }
 
 /*
@@ -320,4 +568,26 @@ int main(int argc, char *argv[])
 	}
 
 	bitc_daemon(updateAndExit, maxPeers);
+
+exit:
+	bitc_process_events();
+	bitc_exit();
+
+	poolworker_wait(btc->pw);
+	ipinfo_exit();
+	poolworker_destroy(btc->pw);
+	curl_global_cleanup();
+	bitc_openssl_exit();
+	mutex_free(btc->lock);
+	secure_free(passphrase);
+	if (errStr) {
+	  printf("%s\n", errStr);
+	} else {
+	  bitc_bye();
+	}
+
+	memset(btc, 0, sizeof *btc);
+	Log_Exit();
+
+	return res;
 }
